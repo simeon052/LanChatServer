@@ -1,0 +1,16 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+## appsettings (APIキーを含むためignore)
+src/LanChatServer/appsettings.json
+
+## ビルド成果物
+publish/
+
+## OS
+.DS_Store
+Thumbs.db
