@@ -1,105 +1,116 @@
 using System.Collections.Concurrent;
-using System.Diagnostics;
-using System.Runtime.CompilerServices;
-using System.Threading.Channels;
+using System.Net.WebSockets;
 using LanChatServer.Config;
 
 namespace LanChatServer.Services;
 
+/// <summary>
+/// ConPTY 経由で Hermes Agent を起動し、WebSocket ターミナルとして公開する。
+/// prompt_toolkit の NoConsoleScreenBufferError を回避するため stdin/stdout リダイレクトは使わない。
+/// </summary>
 public sealed class HermesSession : IAsyncDisposable
 {
     public string Id { get; } = Guid.NewGuid().ToString("N")[..12];
     public DateTimeOffset CreatedAt { get; } = DateTimeOffset.Now;
 
-    private readonly Process _process;
-    // stdout + stderr を統合するチャネル
-    private readonly Channel<string> _output = Channel.CreateUnbounded<string>(
-        new UnboundedChannelOptions { SingleWriter = false, SingleReader = true });
-    // 同時に1会話のみ許可
-    public SemaphoreSlim Gate { get; } = new(1, 1);
+    private readonly ConPtyProcess _pty;
+    private readonly CancellationTokenSource _cts = new();
+    private readonly List<WebSocket> _clients = [];
+    private readonly SemaphoreSlim _clientsLock = new(1, 1);
+    private readonly Task _broadcastTask;
 
-    public bool IsRunning => !_process.HasExited;
+    public bool IsRunning => !_pty.HasExited;
 
-    public HermesSession(Process process)
+    public HermesSession(ConPtyProcess pty)
     {
-        _process = process;
-        _ = PipeAsync(process.StandardOutput);
-        _ = PipeAsync(process.StandardError);
-        _ = WatchExitAsync();
+        _pty = pty;
+        _broadcastTask = BroadcastLoopAsync(_cts.Token);
     }
 
-    private async Task PipeAsync(StreamReader reader)
+    /// <summary>WebSocket クライアントのターミナルセッションを処理する。</summary>
+    public async Task HandleWebSocketAsync(WebSocket ws, CancellationToken ct)
     {
+        await _clientsLock.WaitAsync(ct);
+        _clients.Add(ws);
+        _clientsLock.Release();
+
+        var buf = new byte[1024];
         try
         {
-            while (await reader.ReadLineAsync() is { } line)
-                _output.Writer.TryWrite(line);
-        }
-        catch { }
-    }
-
-    private async Task WatchExitAsync()
-    {
-        try { await _process.WaitForExitAsync(); } catch { }
-        _output.Writer.TryComplete();
-    }
-
-    public async IAsyncEnumerable<string> StreamResponseAsync(
-        string message,
-        int timeoutMs,
-        [EnumeratorCancellation] CancellationToken ct = default)
-    {
-        await Gate.WaitAsync(ct);
-        try
-        {
-            // 以前の残留出力をクリア
-            while (_output.Reader.TryRead(out _)) { }
-
-            await _process.StandardInput.WriteLineAsync(message.AsMemory(), ct);
-            await _process.StandardInput.FlushAsync(ct);
-
-            // タイムアウトベースで応答を収集: timeoutMs 間無音 → 応答完了と判断
-            while (!ct.IsCancellationRequested)
+            // WS からのキー入力を ConPTY へ流す
+            while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
             {
-                using var timeoutCts = new CancellationTokenSource(timeoutMs);
-                using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+                WebSocketReceiveResult result;
+                try { result = await ws.ReceiveAsync(buf, ct); }
+                catch { break; }
 
-                bool hasData;
-                try
+                if (result.MessageType == WebSocketMessageType.Close) break;
+                if (result.Count > 0)
                 {
-                    hasData = await _output.Reader.WaitToReadAsync(linked.Token);
+                    try { await _pty.Input.WriteAsync(buf.AsMemory(0, result.Count), ct); }
+                    catch { break; }
                 }
-                catch (OperationCanceledException)
-                {
-                    break; // タイムアウト or ユーザーキャンセル
-                }
-
-                if (!hasData) break; // プロセス終了でチャネル完了
-
-                while (_output.Reader.TryRead(out var line))
-                    yield return line + "\n";
             }
         }
         finally
         {
-            Gate.Release();
+            await _clientsLock.WaitAsync(CancellationToken.None);
+            _clients.Remove(ws);
+            _clientsLock.Release();
+            if (ws.State == WebSocketState.Open)
+                await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
         }
+    }
+
+    /// <summary>ConPTY 出力を全 WebSocket クライアントにブロードキャストする。</summary>
+    private async Task BroadcastLoopAsync(CancellationToken ct)
+    {
+        var buf = new byte[4096];
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                int n;
+                try { n = await _pty.Output.ReadAsync(buf, ct); }
+                catch { break; }
+                if (n == 0) break;
+
+                var data = new ArraySegment<byte>(buf, 0, n);
+
+                await _clientsLock.WaitAsync(CancellationToken.None);
+                var snapshot = _clients.ToList();
+                _clientsLock.Release();
+
+                foreach (var ws in snapshot)
+                {
+                    if (ws.State != WebSocketState.Open) continue;
+                    try { await ws.SendAsync(data, WebSocketMessageType.Binary, true, CancellationToken.None); }
+                    catch { }
+                }
+            }
+        }
+        catch { }
     }
 
     public async ValueTask DisposeAsync()
     {
-        try
+        _cts.Cancel();
+        try { await _broadcastTask; } catch { }
+
+        await _clientsLock.WaitAsync(CancellationToken.None);
+        var snapshot = _clients.ToList();
+        _clients.Clear();
+        _clientsLock.Release();
+
+        foreach (var ws in snapshot)
         {
-            if (!_process.HasExited)
-            {
-                _process.Kill(entireProcessTree: true);
-                await _process.WaitForExitAsync();
-            }
+            try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None); }
+            catch { }
         }
-        catch { }
-        _output.Writer.TryComplete();
-        Gate.Dispose();
-        _process.Dispose();
+
+        await _pty.DisposeAsync();
+        _cts.Dispose();
+        _clientsLock.Dispose();
     }
 }
 
@@ -110,72 +121,35 @@ public sealed class HermesService : IAsyncDisposable
 
     public HermesService(HermesConfig config) => _config = config;
 
-    public async Task<(HermesSession? Session, string? Error)> CreateSessionAsync(CancellationToken ct = default)
+    public Task<(HermesSession? Session, string? Error)> CreateSessionAsync(CancellationToken ct = default)
     {
-        var psi = new ProcessStartInfo
-        {
-            FileName = _config.Command,
-            Arguments = _config.Arguments,
-            UseShellExecute = false,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-            StandardInputEncoding = System.Text.Encoding.UTF8,
-            StandardOutputEncoding = System.Text.Encoding.UTF8,
-            StandardErrorEncoding = System.Text.Encoding.UTF8,
-        };
-
-        Process process;
+        ConPtyProcess pty;
         try
         {
-            process = Process.Start(psi)
-                ?? throw new InvalidOperationException("プロセスの起動に失敗しました。");
+            pty = ConPtyProcess.Start(_config.Command);
         }
         catch (Exception ex)
         {
-            return (null, $"Hermes の起動に失敗しました: {ex.Message}");
+            return Task.FromResult<(HermesSession?, string?)>((null, $"Hermes の起動に失敗しました: {ex.Message}"));
         }
 
-        var session = new HermesSession(process);
+        var session = new HermesSession(pty);
         _sessions[session.Id] = session;
 
-        // 起動確認のため少し待つ
-        await Task.Delay(600, ct);
-        if (!session.IsRunning)
+        // 起動直後にプロセスが即死していないか確認
+        Task.Delay(800, ct).ContinueWith(t =>
         {
-            _sessions.TryRemove(session.Id, out _);
-            await session.DisposeAsync();
-            return (null, "Hermes プロセスが即座に終了しました。Command パスを確認してください。");
-        }
+            if (!session.IsRunning)
+                _sessions.TryRemove(session.Id, out var removed);
+        }, TaskContinuationOptions.ExecuteSynchronously);
 
-        return (session, null);
+        return Task.FromResult<(HermesSession?, string?)>((session, null));
     }
 
     public IReadOnlyList<HermesSession> ListSessions() =>
         [.. _sessions.Values.OrderByDescending(s => s.CreatedAt)];
 
     public HermesSession? GetSession(string id) => _sessions.GetValueOrDefault(id);
-
-    public async IAsyncEnumerable<string> StreamResponseAsync(
-        string sessionId,
-        string message,
-        [EnumeratorCancellation] CancellationToken ct = default)
-    {
-        if (!_sessions.TryGetValue(sessionId, out var session))
-        {
-            yield return "[ERROR] セッションが見つかりません";
-            yield break;
-        }
-        if (!session.IsRunning)
-        {
-            yield return "[ERROR] Hermes プロセスが終了しています。セッションを作り直してください。";
-            yield break;
-        }
-
-        await foreach (var chunk in session.StreamResponseAsync(message, _config.ResponseTimeoutMs, ct))
-            yield return chunk;
-    }
 
     public async Task<bool> DeleteSessionAsync(string id)
     {

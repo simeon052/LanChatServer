@@ -4,6 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>LanChat</title>
+<!-- xterm.js for Hermes terminal -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -42,12 +46,13 @@ html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sa
 .del-btn:hover{color:#e74c3c;background:#3d1a1a}
 
 /* Main area */
-#chat-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;min-height:52px}
+#chat-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;min-height:52px;flex-shrink:0}
 #chat-title{font-size:15px;font-weight:600;flex:1}
 #chat-subtitle{font-size:12px;color:var(--text2)}
 #no-session{flex:1;display:flex;align-items:center;justify-content:center;color:var(--text2);flex-direction:column;gap:12px}
 #no-session p{font-size:14px}
 
+/* Claude chat */
 #messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
 .msg{display:flex;flex-direction:column;max-width:85%}
 .msg.user{align-self:flex-end}
@@ -60,12 +65,18 @@ html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sa
 .streaming-cursor::after{content:'▋';animation:blink 1s step-end infinite;color:var(--accent)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
 
-#input-area{padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:8px;align-items:flex-end}
+#input-area{padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:8px;align-items:flex-end;flex-shrink:0}
 #input-area textarea{flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:10px 12px;color:var(--text);font-size:14px;resize:none;max-height:120px;min-height:42px;font-family:inherit;line-height:1.4;outline:none}
 #input-area textarea:focus{border-color:var(--accent)}
 #send-btn{background:var(--accent);color:#fff;border:none;border-radius:10px;width:42px;height:42px;cursor:pointer;font-size:18px;flex-shrink:0;display:flex;align-items:center;justify-content:center}
 #send-btn:hover{background:var(--accent2)}
 #send-btn:disabled{background:var(--surface2);color:var(--text2);cursor:not-allowed}
+
+/* Hermes terminal */
+#terminal-container{flex:1;display:flex;flex-direction:column;min-height:0;background:#0d0d0d;padding:8px;position:relative}
+#terminal-container .xterm{height:100%}
+#terminal-container .xterm-viewport{overflow-y:auto!important}
+#term-status{position:absolute;bottom:12px;right:14px;font-size:11px;color:var(--text2);background:rgba(0,0,0,.6);padding:2px 8px;border-radius:10px;pointer-events:none}
 
 /* Modal */
 #modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;align-items:center;justify-content:center}
@@ -124,12 +135,18 @@ html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sa
       <p>左のサイドバーからセッションを選ぶか、<br>「+ 新規」で新しいセッションを作成してください。</p>
     </div>
 
+    <!-- Claude chat UI -->
     <div id="messages" style="display:none"></div>
-
     <div id="input-area" style="display:none">
       <textarea id="msg-input" placeholder="メッセージを入力..." rows="1"
         oninput="autoResize(this)" onkeydown="handleKey(event)"></textarea>
       <button id="send-btn" onclick="sendMessage()">↑</button>
+    </div>
+
+    <!-- Hermes terminal UI -->
+    <div id="terminal-container" style="display:none">
+      <div id="xterm-mount" style="width:100%;height:100%"></div>
+      <div id="term-status">接続中...</div>
     </div>
   </div>
 </div>
@@ -157,7 +174,7 @@ html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sa
       <label>バックエンド</label>
       <select id="sel-backend" onchange="onBackendChange()">
         <option value="claude">Claude (Anthropic API)</option>
-        <option value="hermes">Hermes Agent (CLI)</option>
+        <option value="hermes">Hermes Agent (ターミナル)</option>
       </select>
     </div>
     <div id="claude-opts">
@@ -176,7 +193,8 @@ html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sa
     </div>
     <div id="hermes-opts" style="display:none">
       <div class="hermes-note">
-        ⚡ Hermes Agent を別プロセスとして起動し、stdin/stdout 経由で通信します。<br>
+        ⚡ Hermes Agent を ConPTY（仮想コンソール）経由で起動します。<br>
+        ブラウザ内でフルターミナルとして操作できます。<br>
         <code>hermes</code> コマンドが PATH に存在する必要があります。
       </div>
     </div>
@@ -191,6 +209,12 @@ html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sa
 let currentSessionId = null;
 let currentBackend = null;
 let isStreaming = false;
+
+// Hermes terminal state
+let hermesWs = null;
+let hermesTerminal = null;
+let hermesFitAddon = null;
+let hermesResizeObserver = null;
 
 // ---- Sessions ----
 async function loadSessions() {
@@ -228,6 +252,9 @@ function renderSessionList(sessions) {
 }
 
 async function selectSession(id, backend) {
+  // 前の Hermes ターミナルを切断
+  disconnectHermes();
+
   currentSessionId = id;
   currentBackend = backend;
   closeSidebar();
@@ -236,36 +263,111 @@ async function selectSession(id, backend) {
   const session = await res.json();
 
   document.getElementById('chat-title').textContent = session.name;
-  document.getElementById('chat-subtitle').textContent =
-    backend === 'hermes'
-      ? (session.isActive ? '● 実行中' : '● 停止')
-      : (session.systemPrompt ? `System: ${session.systemPrompt.slice(0, 50)}…` : '');
   document.getElementById('no-session').style.display = 'none';
-  document.getElementById('messages').style.display = 'flex';
-  document.getElementById('input-area').style.display = 'flex';
 
-  const msgs = document.getElementById('messages');
-  msgs.innerHTML = '';
+  if (backend === 'hermes') {
+    // Hermes: ターミナル表示
+    document.getElementById('messages').style.display = 'none';
+    document.getElementById('input-area').style.display = 'none';
+    document.getElementById('terminal-container').style.display = 'flex';
+    document.getElementById('chat-subtitle').textContent = session.isActive ? '● 実行中 (ターミナル)' : '● 停止';
+    if (session.isActive) connectHermes(id);
+  } else {
+    // Claude: チャット表示
+    document.getElementById('terminal-container').style.display = 'none';
+    document.getElementById('messages').style.display = 'flex';
+    document.getElementById('input-area').style.display = 'flex';
+    document.getElementById('chat-subtitle').textContent =
+      session.systemPrompt ? `System: ${session.systemPrompt.slice(0, 50)}…` : '';
 
-  if (session.messages) {
-    for (const m of session.messages)
-      appendMessage(m.role, m.content);
+    const msgs = document.getElementById('messages');
+    msgs.innerHTML = '';
+    if (session.messages) {
+      for (const m of session.messages) appendMessage(m.role, m.content);
+    }
+    scrollToBottom();
+    document.getElementById('msg-input').focus();
   }
 
-  scrollToBottom();
-  document.getElementById('msg-input').focus();
   await loadSessions();
 }
 
+// ---- Hermes terminal ----
+function connectHermes(id) {
+  const mount = document.getElementById('xterm-mount');
+  mount.innerHTML = '';
+
+  hermesTerminal = new Terminal({
+    cursorBlink: true,
+    theme: { background: '#0d0d0d', foreground: '#e8e8e8', cursor: '#6c9fde' },
+    fontFamily: "'Cascadia Code', 'Consolas', 'Courier New', monospace",
+    fontSize: 13,
+    scrollback: 2000,
+  });
+
+  hermesFitAddon = new FitAddon.FitAddon();
+  hermesTerminal.loadAddon(hermesFitAddon);
+  hermesTerminal.open(mount);
+  hermesFitAddon.fit();
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsUrl = `${proto}://${location.host}/api/sessions/${id}/terminal`;
+  hermesWs = new WebSocket(wsUrl);
+  hermesWs.binaryType = 'arraybuffer';
+
+  const statusEl = document.getElementById('term-status');
+  statusEl.textContent = '接続中...';
+
+  hermesWs.onopen = () => {
+    statusEl.textContent = '接続済み';
+    setTimeout(() => { statusEl.style.opacity = '0.4'; }, 2000);
+  };
+
+  hermesWs.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) {
+      hermesTerminal.write(new Uint8Array(e.data));
+    }
+  };
+
+  hermesWs.onerror = () => { statusEl.textContent = 'エラー'; statusEl.style.opacity = '1'; };
+  hermesWs.onclose = () => {
+    statusEl.textContent = '切断';
+    statusEl.style.opacity = '1';
+  };
+
+  // キー入力を ConPTY へ送る
+  hermesTerminal.onData((data) => {
+    if (hermesWs && hermesWs.readyState === WebSocket.OPEN) {
+      hermesWs.send(new TextEncoder().encode(data));
+    }
+  });
+
+  // リサイズ追従
+  hermesResizeObserver = new ResizeObserver(() => {
+    try { hermesFitAddon.fit(); } catch(e) {}
+  });
+  hermesResizeObserver.observe(mount);
+}
+
+function disconnectHermes() {
+  if (hermesResizeObserver) { hermesResizeObserver.disconnect(); hermesResizeObserver = null; }
+  if (hermesWs) { hermesWs.close(); hermesWs = null; }
+  if (hermesTerminal) { hermesTerminal.dispose(); hermesTerminal = null; }
+  document.getElementById('term-status').style.opacity = '1';
+}
+
+// ---- Session actions ----
 async function deleteSession(e, id) {
   e.stopPropagation();
   if (!confirm('このセッションを削除しますか？')) return;
+  if (currentSessionId === id) disconnectHermes();
   await fetch(`/api/sessions/${id}`, { method: 'DELETE' });
   if (currentSessionId === id) {
     currentSessionId = null;
     document.getElementById('no-session').style.display = 'flex';
     document.getElementById('messages').style.display = 'none';
     document.getElementById('input-area').style.display = 'none';
+    document.getElementById('terminal-container').style.display = 'none';
   }
   await loadSessions();
 }
@@ -278,9 +380,10 @@ function openNewModal() {
 function closeModal() { document.getElementById('modal-overlay').classList.remove('open'); }
 function onBackendChange() {
   const b = document.getElementById('sel-backend').value;
-  document.getElementById('claude-opts').style.display = b === 'claude' ? 'flex' : 'none';
-  document.getElementById('claude-opts').style.flexDirection = 'column';
-  document.getElementById('claude-opts').style.gap = '12px';
+  const co = document.getElementById('claude-opts');
+  co.style.display = b === 'claude' ? 'flex' : 'none';
+  co.style.flexDirection = 'column';
+  co.style.gap = '12px';
   document.getElementById('hermes-opts').style.display = b === 'hermes' ? 'block' : 'none';
 }
 
@@ -307,9 +410,9 @@ async function createSession() {
   selectSession(session.id, backend);
 }
 
-// ---- Chat ----
+// ---- Claude Chat ----
 async function sendMessage() {
-  if (isStreaming || !currentSessionId) return;
+  if (isStreaming || !currentSessionId || currentBackend !== 'claude') return;
   const input = document.getElementById('msg-input');
   const content = input.value.trim();
   if (!content) return;
@@ -375,7 +478,7 @@ function appendMessage(role, content) {
   const msgs = document.getElementById('messages');
   const div = document.createElement('div');
   div.className = `msg ${role}`;
-  const label = role === 'user' ? 'あなた' : (currentBackend === 'hermes' ? 'Hermes' : 'Claude');
+  const label = role === 'user' ? 'あなた' : 'Claude';
   div.innerHTML = `<div class="msg-label">${label}</div><div class="msg-bubble">${escHtml(content)}</div>`;
   msgs.appendChild(div);
   scrollToBottom();
@@ -412,7 +515,6 @@ function fmtTime(iso) {
   return new Date(iso).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
 }
 
-// Close modal on overlay click
 document.getElementById('modal-overlay').addEventListener('click', e => {
   if (e.target === document.getElementById('modal-overlay')) closeModal();
 });

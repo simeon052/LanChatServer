@@ -24,6 +24,7 @@ builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
 
 var app = builder.Build();
 app.UseCors();
+app.UseWebSockets();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
@@ -172,20 +173,37 @@ app.MapPost("/api/sessions/{id}/messages", async (string id, SendMessageRequest 
     var hs = hermes.GetSession(id);
     if (hs is not null)
     {
-        Log("INFO", $"Hermes [{id}] ← \"{Clip(req.Content)}\" (from {from})");
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        int chars = 0;
-        await foreach (var chunk in hermes.StreamResponseAsync(id, req.Content, ct))
-        {
-            chars += chunk.Length;
-            await WriteSseAsync(chunk);
-        }
-        await WriteSseAsync("", done: true);
-        Log("OK", $"Hermes [{id}] → {chars}文字 ({sw.ElapsedMilliseconds}ms)");
+        await Results.Json(new { error = "Hermes はターミナル(WebSocket)でのみ操作できます。/terminal エンドポイントを使用してください。" }, jsonOpts, statusCode: 400).ExecuteAsync(ctx);
         return;
     }
 
     await Results.Json(new { error = "セッションが見つかりません" }, jsonOpts, statusCode: 404).ExecuteAsync(ctx);
+});
+
+// ---- Hermes ターミナル (WebSocket) ----
+app.Map("/api/sessions/{id}/terminal", async (string id, HermesService hermes, HttpContext ctx) =>
+{
+    if (!ctx.WebSockets.IsWebSocketRequest)
+    {
+        ctx.Response.StatusCode = 400;
+        await ctx.Response.WriteAsync("WebSocket 接続が必要です");
+        return;
+    }
+
+    var session = hermes.GetSession(id);
+    if (session is null)
+    {
+        ctx.Response.StatusCode = 404;
+        return;
+    }
+
+    var from = ctx.Connection.RemoteIpAddress?.ToString() ?? "?";
+    Log("INFO", $"Hermes WS 接続 [{id}] (from {from})");
+
+    var ws = await ctx.WebSockets.AcceptWebSocketAsync();
+    await session.HandleWebSocketAsync(ws, ctx.RequestAborted);
+
+    Log("OK", $"Hermes WS 切断 [{id}] (from {from})");
 });
 
 // ---- Claude Code セッション一覧 ----
