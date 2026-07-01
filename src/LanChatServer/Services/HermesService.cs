@@ -19,6 +19,11 @@ public sealed class HermesSession : IAsyncDisposable
     private readonly SemaphoreSlim _clientsLock = new(1, 1);
     private readonly Task _broadcastTask;
 
+    // 起動バナーなど WS 接続前の出力を保持するリプレイバッファ (最大 256 KB)
+    private readonly List<byte[]> _replayChunks = [];
+    private int _replayTotalBytes;
+    private const int MaxReplayBytes = 256 * 1024;
+
     public bool IsRunning => !_pty.HasExited;
 
     public HermesSession(ConPtyProcess pty)
@@ -31,8 +36,17 @@ public sealed class HermesSession : IAsyncDisposable
     public async Task HandleWebSocketAsync(WebSocket ws, CancellationToken ct)
     {
         await _clientsLock.WaitAsync(ct);
+        // 接続前に蓄積された出力をまず送る (起動バナー等)
+        var replaySnapshot = _replayChunks.ToList();
         _clients.Add(ws);
         _clientsLock.Release();
+
+        foreach (var chunk in replaySnapshot)
+        {
+            if (ws.State != WebSocketState.Open) break;
+            try { await ws.SendAsync(new ArraySegment<byte>(chunk), WebSocketMessageType.Binary, true, ct); }
+            catch { break; }
+        }
 
         var buf = new byte[1024];
         try
@@ -62,7 +76,7 @@ public sealed class HermesSession : IAsyncDisposable
         }
     }
 
-    /// <summary>ConPTY 出力を全 WebSocket クライアントにブロードキャストする。</summary>
+    /// <summary>ConPTY 出力を全 WebSocket クライアントにブロードキャストし、リプレイバッファにも蓄積する。</summary>
     private async Task BroadcastLoopAsync(CancellationToken ct)
     {
         var buf = new byte[4096];
@@ -75,12 +89,21 @@ public sealed class HermesSession : IAsyncDisposable
                 catch { break; }
                 if (n == 0) break;
 
-                var data = new ArraySegment<byte>(buf, 0, n);
+                var chunk = buf[..n];
 
                 await _clientsLock.WaitAsync(CancellationToken.None);
+                // リプレイバッファに追加 (上限超えたら古いものから削除)
+                _replayChunks.Add(chunk);
+                _replayTotalBytes += n;
+                while (_replayTotalBytes > MaxReplayBytes && _replayChunks.Count > 0)
+                {
+                    _replayTotalBytes -= _replayChunks[0].Length;
+                    _replayChunks.RemoveAt(0);
+                }
                 var snapshot = _clients.ToList();
                 _clientsLock.Release();
 
+                var data = new ArraySegment<byte>(chunk);
                 foreach (var ws in snapshot)
                 {
                     if (ws.State != WebSocketState.Open) continue;
